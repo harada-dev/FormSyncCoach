@@ -158,14 +158,50 @@ enum JointAngles {
 
     // MARK: - 蹴り足の判定
 
-    /// つま先の移動速度が大きい側を蹴り足とみなす。
+    /// つま先の移動が速い側を蹴り足とみなす。
     ///
-    /// 実測では蹴り足と軸足でつま先の最大速度に 3〜6 倍の差が出ました
-    /// （右 4.21 対 左 0.74 など）。ユーザーに利き足を尋ねる必要はありません。
+    /// 実測では蹴り足と軸足でピーク値に 3〜6 倍の差が出ました
+    /// （右 4.21 対 左 0.74 など）。**この 4.21 / 0.74 という数値は
+    /// 正規化画像座標/秒であり、m/s ではありません。**
+    /// それでも左右の判定には十分なので、ユーザーに利き足を尋ねる必要はありません。
+    ///
+    /// **左右の比較ロジックは意図的にこのままにしてあります。**
+    /// `peakToeSpeedNormalized` が返すのは無次元量ですが、左右は同一の映像・
+    /// 同一のスケールから求めているため、比を取ると未知のスケール係数
+    /// （被写体位置での画角の実寸、アスペクト比）が約分されます。
+    /// したがって単位が m/s でなくても蹴り足の自動判定は正しく成立します。
+    /// 「単位が違うから」という理由でここを書き換えないでください。
+    /// 絶対速度が必要になったときはこの関数を流用せず、metric な世界座標
+    /// （`PoseFrame.worldPoint(_:)`）と接地足を基準にした並進成分の復元に基づく
+    /// 別の指標として、新たに実装してください。
     static func kickingSide(_ sequence: PoseSequence) -> Side? {
         guard sequence.frames.count > 2 else { return nil }
 
-        func peakToeSpeed(_ side: Side) -> Double {
+        /// つま先のフレーム間移動量の最大値。
+        ///
+        /// - Returns: **無次元（正規化画像座標/秒）。**
+        ///   `Keypoint` は画像上の正規化座標（x, y は 0...1、左上原点）なので、
+        ///   その差分を時間で割った値はメートルでもピクセルでもありません。
+        ///   metric な `worldPoint()` はここでは一切使っていません。
+        ///   **利き足判定専用の比較値であり、絶対速度ではありません。**
+        ///   m/s を前提とする指標（文献のつま先速度 m/s との突合や、
+        ///   実測された m/s との相関を根拠にした診断など）に
+        ///   この値を流用してはなりません。
+        ///
+        /// - Note: **アスペクト比による既知の歪み（未補正）。**
+        ///   MediaPipe は x を画像の幅、y を高さで正規化するため、dx と dy を
+        ///   そのままユークリッドノルムで合成すると、縦方向の移動が
+        ///   アスペクト比の分（16:9 なら約 1.78 倍）過大に重み付けされます。
+        ///   補正には元画像のピクセル寸法が必要ですが、`PoseModels.swift` の
+        ///   `PoseFrame` / `PoseSequence` は寸法を保持しておらず、寸法を知っているのは
+        ///   `VideoPoseAnalyzer.analyze` の `renderSize`（外には
+        ///   `VideoAnalysisResult.width` / `.height` としてのみ出る）だけです。
+        ///   `.fsc` 形式（`SkeletonDocument` v2）にも寸法フィールドはないため、
+        ///   読み込んだ骨格ファイルでは原理的に復元できません。補正するには
+        ///   モデル・解析器・永続化形式の同時改修（形式 v3）が必要になるので、
+        ///   ここでは**あえて補正していません**。
+        ///   左右比較への影響はありません（両足に同じ係数が乗り、比で約分される）。
+        func peakToeSpeedNormalized(_ side: Side) -> Double {
             var peak = 0.0
             for i in 0..<(sequence.frames.count - 1) {
                 let a = sequence.frames[i]
@@ -177,6 +213,7 @@ enum JointAngles {
                 guard p1.visibility >= visibilityThreshold,
                       p2.visibility >= visibilityThreshold else { continue }
 
+                // 正規化画像座標での移動量。アスペクト比は未補正（上の Note 参照）。
                 let d = (Double(p2.x - p1.x) * Double(p2.x - p1.x)
                     + Double(p2.y - p1.y) * Double(p2.y - p1.y)).squareRoot()
                 peak = max(peak, d / dt)
@@ -184,8 +221,9 @@ enum JointAngles {
             return peak
         }
 
-        let left = peakToeSpeed(.left)
-        let right = peakToeSpeed(.right)
+        // 無次元量どうしの比較。単位は左右で共通なので判定に影響しない。
+        let left = peakToeSpeedNormalized(.left)
+        let right = peakToeSpeedNormalized(.right)
         guard max(left, right) > 0 else { return nil }
         return right > left ? .right : .left
     }
